@@ -10,7 +10,8 @@ import sqlite3
 import unicodedata
 from urllib.parse import urlparse, unquote
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TALB, TPE1, TIT2, TDRC, COMM, TPE2, TCON
+from mutagen.id3 import ID3, TALB, TPE1, TIT2, TDRC, COMM, TPE2, TCON, APIC
+import mimetypes
 
 """
 RSS Downloader Script
@@ -196,6 +197,71 @@ def fetch_rss_feed(url):
         logging.error("Exiting...")
         exit(1)
 
+def get_feed_artwork_url(feed, mp3_album_artwork=None):
+    """
+    Resolve artwork URL in this order:
+    1. --mp3-album-artwork CLI flag
+    2. <itunes:image href="...">
+    3. <image><url>...</url></image>
+    4. None
+    """
+    if mp3_album_artwork:
+        return mp3_album_artwork
+
+    feed_meta = getattr(feed, 'feed', {})
+
+    # feedparser often exposes <itunes:image href="..."> as feed.feed.image.href
+    image_data = feed_meta.get('image')
+    if isinstance(image_data, dict):
+        if image_data.get('href'):
+            return image_data.get('href')
+        if image_data.get('url'):
+            return image_data.get('url')
+
+    # fallback for namespaced fields if present
+    if feed_meta.get('itunes_image'):
+        itunes_image = feed_meta.get('itunes_image')
+        if isinstance(itunes_image, dict) and itunes_image.get('href'):
+            return itunes_image.get('href')
+        if isinstance(itunes_image, str):
+            return itunes_image
+
+    return None
+
+
+def download_binary(url, retries=3):
+    """Download binary content from a URL with retry logic."""
+    attempt = 0
+    while attempt < retries:
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            return response.content, response.headers.get('Content-Type')
+        except requests.RequestException as e:
+            attempt += 1
+            logging.warning(f"Error downloading binary file (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                sleep_time = 2 ** attempt
+                logging.info(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                logging.error(f"Failed to download binary content from {url} after {retries} attempts.")
+    return None, None
+
+
+def guess_mime_type_from_url(url, content_type_header=None):
+    """Best-effort MIME type detection for artwork."""
+    if content_type_header:
+        mime = content_type_header.split(';')[0].strip()
+        if mime.startswith('image/'):
+            return mime
+
+    guessed, _ = mimetypes.guess_type(url)
+    if guessed and guessed.startswith('image/'):
+        return guessed
+
+    return 'image/jpeg'
+
 def save_text_file(entry, filename):
     """Save podcast details in a text file."""
     with open(f"{filename}.txt", 'w') as file:
@@ -204,7 +270,7 @@ def save_text_file(entry, filename):
         file.write(f"Published Date: {entry.get('published', 'N/A')}\n")
         file.write(f"Content: {entry.get('summary', 'N/A')}\n")
 
-def set_mp3_tags(filename, entry, feed, mp3_genre):
+def set_mp3_tags(filename, entry, feed, mp3_genre, artwork_url=None):
     """Set MP3 tags using metadata from the RSS feed."""
     try:
         audio = MP3(filename, ID3=ID3)
@@ -249,17 +315,46 @@ def set_mp3_tags(filename, entry, feed, mp3_genre):
     else:
         audio.tags.add(TCON(encoding=3, text='Podcast'))
 
+    # Album artwork
+    if artwork_url:
+        image_data, content_type = download_binary(artwork_url)
+        if image_data:
+            mime_type = guess_mime_type_from_url(artwork_url, content_type)
+
+            # Remove existing front cover(s) to avoid duplicates
+            audio.tags.delall('APIC')
+
+            audio.tags.add(
+                APIC(
+                    encoding=3,          # UTF-8
+                    mime=mime_type,      # e.g. image/jpeg or image/png
+                    type=3,              # 3 = front cover
+                    desc='Cover',
+                    data=image_data
+                )
+            )
+            logging.info(f"Embedded album artwork into: {filename}")
+        else:
+            logging.warning(f"Could not download artwork from: {artwork_url}")
+
+
     audio.save()
     logging.info(f"Successfully set MP3 tags for: {filename}")
 
 
-def parse_and_download(content, save_dir, save_text, num_episodes=None, conn=None, feed_id=None, feed=None, mp3_genre=None):
+def parse_and_download(content, save_dir, save_text, num_episodes=None, conn=None, feed_id=None, feed=None, mp3_genre=None, mp3_album_artwork=None):
     """Parse the RSS feed and download files."""
     if not conn or not feed_id or not feed:
         logging.error("Database connection, feed_id, or feed object not provided.")
         return
 
     cursor = conn.cursor()
+
+    artwork_url = get_feed_artwork_url(feed, mp3_album_artwork)
+    if artwork_url:
+        logging.info(f"Using artwork URL: {artwork_url}")
+    else:
+        logging.info("No artwork URL found; MP3 files will be saved without embedded artwork.")
 
     all_episodes = [
         (entry, link)
@@ -319,7 +414,7 @@ def parse_and_download(content, save_dir, save_text, num_episodes=None, conn=Non
 
             # Set MP3 tags
             if filename.lower().endswith('.mp3'):
-                set_mp3_tags(filename, entry, feed, mp3_genre)
+                set_mp3_tags(filename, entry, feed, mp3_genre, artwork_url)
 
             if save_text:
                 save_text_file(entry, filename)
@@ -337,6 +432,7 @@ def main():
     parser.add_argument('--save_text', action='store_true', help='Flag to save text files with extra episode data')
     parser.add_argument('--num-episodes', type=int, default=None, help='Number of additional episodes to download')
     parser.add_argument('--mp3-genre', type=str, default=None, help='Genre to set in MP3 tags (Podcast is used if not provided)')
+    parser.add_argument('--mp3-album-artwork', type=str, default=None, help='Artwork URL to embed into MP3 files; if omitted, tries <itunes:image> then <image><url>')
     args = parser.parse_args()
 
     # Create save_dir if it doesn't exist
@@ -350,7 +446,7 @@ def main():
             feed = feedparser.parse(content)
             conn = setup_database()
             feed_id = get_or_create_feed(conn, args.rss_url, feed.feed.get('title', 'N/A'))
-            parse_and_download(content, args.save_dir, args.save_text, args.num_episodes, conn, feed_id, feed, args.mp3_genre)
+            parse_and_download(content, args.save_dir, args.save_text, args.num_episodes, conn, feed_id, feed, args.mp3_genre, args.mp3_album_artwork)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}", exc_info=True)
     finally:
